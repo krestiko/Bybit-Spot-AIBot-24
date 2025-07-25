@@ -28,7 +28,7 @@ def send_telegram(msg):
 session = HTTP(api_key=api_key, api_secret=api_secret)
 
 def get_price():
-    data = session.get_ticker(symbol=symbol)
+    data = session.get_tickers(category="spot", symbol=symbol)
     return float(data["result"]["list"][0]["lastPrice"])
 
 def place_order(side, price):
