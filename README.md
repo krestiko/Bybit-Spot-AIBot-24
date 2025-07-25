@@ -21,4 +21,3 @@ python main.py
 
 ## Переменные окружения
 Смотри `.env.example` — туда вставляются ключи от Bybit и Telegram.
- 
