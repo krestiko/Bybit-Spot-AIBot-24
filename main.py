@@ -1,4 +1,9 @@
-import time, os, logging
+import time
+import os
+import logging
+from collections import deque
+import numpy as np
+from sklearn.linear_model import SGDClassifier
 from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 
@@ -13,8 +18,16 @@ tp_percent = float(os.getenv("TP_PERCENT", 1.5))
 sl_percent = float(os.getenv("SL_PERCENT", 1.0))
 interval = int(os.getenv("INTERVAL", 5)) * 60
 
+# length of price history to use for learning
+history_len = int(os.getenv("HISTORY_LENGTH", 5))
+
 telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
 telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+# containers for price history and ML model
+price_history = deque(maxlen=history_len + 1)
+model = SGDClassifier(loss="log_loss")
+model_initialized = False
 
 def send_telegram(msg):
     if not telegram_token or not telegram_chat_id: return
@@ -30,6 +43,22 @@ session = HTTP(api_key=api_key, api_secret=api_secret)
 def get_price():
     data = session.get_tickers(category="spot", symbol=symbol)
     return float(data["result"]["list"][0]["lastPrice"])
+
+def extract_features(history):
+    arr = np.array(history, dtype=float)
+    returns = np.diff(arr) / arr[:-1]
+    return returns.reshape(1, -1)
+
+def update_model(new_price):
+    global model_initialized
+    price_history.append(new_price)
+    if len(price_history) < history_len + 1:
+        return None
+    features = extract_features(list(price_history)[:-1])
+    label = 1 if price_history[-1] > price_history[-2] else 0
+    model.partial_fit(features, [label], classes=[0, 1])
+    model_initialized = True
+    return extract_features(list(price_history)[-history_len:])
 
 def place_order(side, price):
     try:
@@ -48,11 +77,16 @@ def trade_loop():
     while True:
         try:
             price = get_price()
-            logging.info(f"Price: {price}")
-            if int(price) % 2 == 0:
-                place_order("Buy", price)
+            logging.info(f"Price: {price}")           
+            features = update_model(price)
+            if model_initialized and features is not None:
+                prediction = model.predict(features)[0]
+                side = "Buy" if prediction == 1 else "Sell"
+                place_order(side, price)
             else:
-                place_order("Sell", price)
+                # fallback: trade based on price parity until model ready
+                side = "Buy" if int(price) % 2 == 0 else "Sell"
+                place_order(side, price)
         except Exception as e:
             logging.error(f"Loop error: {e}")
             send_telegram(f"Bot error: {e}")
