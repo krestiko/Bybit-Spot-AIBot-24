@@ -55,7 +55,7 @@ session = HTTP(api_key=api_key, api_secret=api_secret)
 def get_price():
     for _ in range(max_retries):
         try:
-            data = session.get_tickers(category="spot", symbol=symbol)
+             data = session.get_tickers(category="spot", symbol=symbol)
             return float(data["result"]["list"][0]["lastPrice"])
         except Exception as e:
             logging.warning(f"Price fetch error: {e}")
@@ -79,12 +79,17 @@ def update_model(new_price):
     model_initialized = True
     return extract_features(list(price_history)[-history_len:])
 
-def place_order(side, price):
-  for _ in range(max_retries):
+def place_order(side, price):  
+    for _ in range(max_retries):
         try:
-            session.place_order(category="spot", symbol=symbol, side=side,
-                                order_type="Market", quote_qty=trade_amount,
-                                time_in_force="IOC")
+            session.place_order(
+                category="spot",
+                symbol=symbol,
+                side=side,
+                order_type="Market",
+                quote_qty=trade_amount,
+                time_in_force="IOC",
+            )
             msg = f"{side} executed {symbol} at {price}"
             logging.info(msg)
             send_telegram(msg)
@@ -110,36 +115,3 @@ def trade_loop():
                 if price >= position_price * (1 + tp_percent / 100):
                     if place_order("Sell", price):
                         send_telegram(f"Take profit at {price}")
-                        position_price = None
-                    time.sleep(interval)
-                    continue
-                if price <= position_price * (1 - sl_percent / 100):
-                    if place_order("Sell", price):
-                        send_telegram(f"Stop loss at {price}")
-                        position_price = None
-                    time.sleep(interval)
-                    continue
-
-            if model_initialized and features is not None:
-                prediction = model.predict(features)[0]
-                decision = "Buy" if prediction == 1 else "Sell"
-            else:
-                if len(price_history) >= 2:
-                    avg = sum(price_history) / len(price_history)
-                    decision = "Buy" if price > avg else "Sell"
-                else:
-                    decision = "Buy" if int(price) % 2 == 0 else "Sell"
-
-            if position_price is None and decision == "Buy":
-                if place_order("Buy", price):
-                    position_price = price
-            elif position_price is not None and decision == "Sell":
-                if place_order("Sell", price):
-                    position_price = None
-        except Exception as e:
-            logging.error(f"Loop error: {e}")
-            send_telegram(f"Bot error: {e}")
-        time.sleep(interval)
-
-if __name__ == "__main__":
-    trade_loop()
