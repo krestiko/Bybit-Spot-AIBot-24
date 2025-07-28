@@ -1,3 +1,6 @@
 pybit
 python-dotenv
 requests
+numpy
+pandas
+scikit-learn
