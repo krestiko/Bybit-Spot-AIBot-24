@@ -5,7 +5,8 @@ import numpy as np
 from sklearn.linear_model import SGDClassifier
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, GridSearchCV
+from xgboost import XGBClassifier
 import pandas as pd
 import pandas_ta as ta
 import joblib
@@ -13,7 +14,12 @@ from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log_file = os.getenv("LOG_FILE", "bot.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
+)
 
 api_key = os.getenv("BYBIT_API_KEY")
 api_secret = os.getenv("BYBIT_API_SECRET")
@@ -30,6 +36,8 @@ price_file = os.getenv("PRICE_HISTORY_FILE", "price_history.csv")
 trade_file = os.getenv("TRADE_HISTORY_FILE", "trade_history.csv")
 trailing_percent = float(os.getenv("TRAILING_PERCENT", 0))
 model_type = os.getenv("MODEL_TYPE", "gb")
+daily_loss_limit = float(os.getenv("DAILY_STOP_LOSS", 0))
+daily_profit_limit = float(os.getenv("DAILY_TAKE_PROFIT", 0))
 
 telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
 telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -48,14 +56,19 @@ if os.path.exists(model_file):
     scaler = saved.get("scaler", scaler)
     model_initialized = True
 else:
-    if model_type == "gb":
+    if model_type == "xgb":
+        model = XGBClassifier(use_label_encoder=False, eval_metric="logloss")
+    elif model_type == "gb":
         model = GradientBoostingClassifier()
     else:
         model = SGDClassifier(loss="log_loss")
     model_initialized = False
 
-# price at which current position was opened; None means no position
+# price and amount of the current position; None means no position
 position_price = None
+position_amount = 0.0
+daily_pnl = 0.0
+daily_date = time.strftime("%Y-%m-%d")
 
 def send_telegram(msg):
     if not telegram_token or not telegram_chat_id: return
@@ -92,10 +105,20 @@ def compute_features(df):
     bb = ta.bbands(df["close"], length=5)
     df["bb_upper"] = bb["BBU_5_2.0"]
     df["bb_lower"] = bb["BBL_5_2.0"]
+    df["sma"] = ta.sma(df["close"], length=10)
+    df["ema"] = ta.ema(df["close"], length=10)
+    adx = ta.adx(df["close"], length=14)
+    df["adx"] = adx["ADX_14"]
+    stoch = ta.stoch(df["close"])
+    df["stoch_k"] = stoch["STOCHk_14_3_3"]
+    df["stoch_d"] = stoch["STOCHd_14_3_3"]
+    df["obv"] = ta.obv(df["close"], df["volume"])
+    df["bid_ask_ratio"] = (df["bid_qty"] - df["ask_qty"]) / (df["bid_qty"] + df["ask_qty"])
     row = df.iloc[-1]
-    if row[["rsi", "macd", "bb_upper", "bb_lower"]].isna().any():
+    required = ["rsi", "macd", "bb_upper", "bb_lower", "sma", "ema", "adx", "stoch_k", "stoch_d", "obv", "bid_ask_ratio"]
+    if row[required].isna().any():
         return None
-    feats = row[["rsi", "macd", "bb_upper", "bb_lower", "volume", "bid_qty", "ask_qty"]].values
+    feats = row[required + ["volume"]].values
     return feats.reshape(1, -1)
 
 def append_market_data(price, volume, bid, ask):
@@ -106,7 +129,7 @@ def append_market_data(price, volume, bid, ask):
     history_df.to_csv(price_file, index=False)
 
 def update_model(price, volume, bid, ask):
-    global model_initialized
+    global model_initialized, model
     append_market_data(price, volume, bid, ask)
     if len(history_df) < history_len + 1:
         return None
@@ -122,9 +145,21 @@ def update_model(price, volume, bid, ask):
     scaler.fit(X)
     Xs = scaler.transform(X)
     try:
-        model.fit(Xs, y)
-        if len(y) >= 3:
-            score = cross_val_score(model, Xs, y, cv=3).mean()
+        if len(y) >= 20:
+            if model_type == "xgb":
+                params = {"n_estimators": [50, 100], "max_depth": [3, 5], "learning_rate": [0.05, 0.1]}
+            elif model_type == "gb":
+                params = {"n_estimators": [50, 100], "max_depth": [3, 5]}
+            else:
+                params = {"alpha": [0.0001, 0.001]}
+            grid = GridSearchCV(model, params, cv=3, n_jobs=-1)
+            grid.fit(Xs, y)
+            model = grid.best_estimator_
+            score = grid.best_score_
+        else:
+            model.fit(Xs, y)
+            score = cross_val_score(model, Xs, y, cv=3).mean() if len(y) >= 3 else None
+        if score is not None:
             logging.info(f"CV score: {score:.3f}")
     except Exception as e:
         logging.warning(f"Model train error: {e}")
@@ -141,6 +176,17 @@ def compute_trade_amount():
         return trade_amount
     factor = min(1.0, 0.02 / vol)
     return trade_amount * factor
+
+def reset_daily_pnl():
+    global daily_pnl, daily_date
+    today = time.strftime("%Y-%m-%d")
+    if today != daily_date:
+        daily_date = today
+        daily_pnl = 0.0
+
+def update_pnl(profit):
+    global daily_pnl
+    daily_pnl += profit
  
 def check_balance(side, amount):
     try:
@@ -191,10 +237,19 @@ def place_order(side, price, amount):
 def trade_loop():
     logging.info(f"Bot start: {symbol}, {trade_amount} USDT per trade")
     send_telegram(f"Bot live: trading {symbol}, every {interval//60} min")
-    global position_price, trailing_stop_price
+    global position_price, trailing_stop_price, position_amount
     trailing_stop_price = None
     while True:
         try:
+            reset_daily_pnl()
+            if daily_loss_limit and daily_pnl <= -daily_loss_limit:
+                logging.warning("Daily loss limit reached")
+                time.sleep(interval)
+                continue
+            if daily_profit_limit and daily_pnl >= daily_profit_limit:
+                logging.info("Daily profit target reached")
+                time.sleep(interval)
+                continue
             price, volume, bid, ask = get_market_data()
             logging.info(f"Price: {price}")
             features = update_model(price, volume, bid, ask)
@@ -210,14 +265,20 @@ def trade_loop():
                     amt = compute_trade_amount()
                     if check_balance("Sell", amt) and place_order("Sell", price, amt):
                         send_telegram(f"Take profit at {price}")
+                        profit = (price - position_price) * (position_amount / position_price)
+                        update_pnl(profit)
                         position_price = None
+                        position_amount = 0
                         trailing_stop_price = None
                     continue
                 if price <= sl_level:
                     amt = compute_trade_amount()
                     if check_balance("Sell", amt) and place_order("Sell", price, amt):
                         send_telegram(f"Stop loss at {price}")
+                        profit = (price - position_price) * (position_amount / position_price)
+                        update_pnl(profit)
                         position_price = None
+                        position_amount = 0
                         trailing_stop_price = None
                     continue
 
@@ -235,11 +296,15 @@ def trade_loop():
             if position_price is None and decision == "Buy":
                 if check_balance("Buy", amt) and place_order("Buy", price, amt):
                     position_price = price
+                    position_amount = amt
                     if trailing_percent > 0:
                         trailing_stop_price = price * (1 - trailing_percent / 100)
             elif position_price is not None and decision == "Sell":
                 if check_balance("Sell", amt) and place_order("Sell", price, amt):
+                    profit = (price - position_price) * (position_amount / position_price)
+                    update_pnl(profit)
                     position_price = None
+                    position_amount = 0
                     trailing_stop_price = None
         except Exception as e:
             logging.error(f"Loop error: {e}")
