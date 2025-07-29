@@ -261,3 +261,152 @@ def reset_daily_pnl():
 def update_pnl(profit):
     global daily_pnl
     daily_pnl += profit
+
+def log_trade(side, price, qty, pnl=0.0, tp=None, sl=None):
+    header = not os.path.exists(trade_file)
+    with open(trade_file, "a") as f:
+        if header:
+            f.write("time,side,price,qty,pnl,tp,sl\n")
+        f.write(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')},{side},{price},{qty},{pnl},{tp},{sl}\n"
+        )
+
+
+simulate = not (api_key and api_secret)
+use_websocket = os.getenv("USE_WEBSOCKET", "0") == "1"
+last_price = None
+position_side = None  # 'long' or 'short'
+trailing_price = None
+
+def place_order(side, qty, tp=None, sl=None):
+    if simulate:
+        logging.info(f"Simulated order: {side} {qty}")
+        return {"price": last_price, "qty": qty}
+    for _ in range(max_retries):
+        try:
+            return session.place_order(
+                category="spot",
+                symbol=symbol,
+                side="Buy" if side.lower() == "buy" else "Sell",
+                orderType="Market",
+                qty=qty,
+                takeProfit=tp,
+                stopLoss=sl,
+            )
+        except Exception as e:
+            logging.warning(f"Order error: {e}")
+            time.sleep(1)
+    raise RuntimeError("Failed to place order")
+
+
+def open_long(price):
+    global position_price, position_amount, position_side, trailing_price
+    qty = compute_trade_amount() / price
+    place_order("buy", qty, tp=price * (1 + tp_percent / 100), sl=price * (1 - sl_percent / 100))
+    position_price = price
+    position_amount = qty
+    position_side = "long"
+    trailing_price = price * (1 - trailing_percent / 100) if trailing_percent else None
+    log_trade("buy", price, qty, tp=tp_percent, sl=sl_percent)
+    send_telegram(f"Opened long {qty:.6f} {symbol} @ {price}")
+
+
+def open_short(price):
+    global position_price, position_amount, position_side, trailing_price
+    qty = compute_trade_amount() / price
+    place_order("sell", qty, tp=price * (1 - tp_percent / 100), sl=price * (1 + sl_percent / 100))
+    position_price = price
+    position_amount = -qty
+    position_side = "short"
+    trailing_price = price * (1 + trailing_percent / 100) if trailing_percent else None
+    log_trade("sell", price, qty, tp=tp_percent, sl=sl_percent)
+    send_telegram(f"Opened short {qty:.6f} {symbol} @ {price}")
+
+
+def close_position(price):
+    global position_price, position_amount, position_side, trailing_price
+    if position_amount == 0:
+        return
+    side = "sell" if position_amount > 0 else "buy"
+    qty = abs(position_amount)
+    place_order(side, qty)
+    pnl = (price - position_price) * position_amount
+    update_pnl(pnl)
+    log_trade("close", price, qty, pnl)
+    send_telegram(f"Closed position {side} pnl={pnl:.2f}")
+    position_amount = 0
+    position_price = None
+    position_side = None
+    trailing_price = None
+
+
+def handle_trailing(price):
+    global trailing_price
+    if trailing_price is None:
+        return False
+    if position_side == "long":
+        if price > position_price and price * (1 - trailing_percent / 100) > trailing_price:
+            trailing_price = price * (1 - trailing_percent / 100)
+        if price <= trailing_price:
+            return True
+    else:
+        if price < position_price and price * (1 + trailing_percent / 100) < trailing_price:
+            trailing_price = price * (1 + trailing_percent / 100)
+        if price >= trailing_price:
+            return True
+    return False
+
+
+def trade_cycle():
+    global last_price
+    if use_websocket:
+        from pybit.unified_trading import WebSocket
+
+        def _cb(msg):
+            global last_price
+            data = msg.get("data")
+            if isinstance(data, list):
+                data = data[0]
+            lp = data.get("lastPrice") or data.get("lp")
+            if lp:
+                last_price = float(lp)
+
+        ws = WebSocket("spot")
+        ws.ticker_stream(symbol, _cb)
+
+    while True:
+        reset_daily_pnl()
+        if daily_loss_limit and daily_pnl <= -daily_loss_limit:
+            logging.warning("Daily loss limit reached")
+            break
+        if daily_profit_limit and daily_pnl >= daily_profit_limit:
+            logging.info("Daily profit target reached")
+            break
+        if last_price is None:
+            price, vol, bid, ask = get_market_data()
+        else:
+            price = last_price
+            vol = 0
+            bid = ask = 0
+        features = update_model(price, vol, bid, ask)
+        if features is None:
+            time.sleep(interval)
+            continue
+        prob = model.predict_proba(features)[0][1]
+
+        if position_amount > 0:  # long
+            if price >= position_price * (1 + tp_percent / 100) or price <= position_price * (1 - sl_percent / 100) or handle_trailing(price):
+                close_position(price)
+        elif position_amount < 0:  # short
+            if price <= position_price * (1 - tp_percent / 100) or price >= position_price * (1 + sl_percent / 100) or handle_trailing(price):
+                close_position(price)
+        if position_amount == 0:
+            if prob > 0.55:
+                open_long(price)
+            elif prob < 0.45:
+                open_short(price)
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    trade_cycle()
