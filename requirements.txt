@@ -7,3 +7,5 @@ scikit-learn
 joblib
 pandas_ta
 xgboost
+PyYAML
+pytest
