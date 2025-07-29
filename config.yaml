@@ -1,0 +1,14 @@
+# Strategy configuration
+trade:
+  tp_percent: 1.5
+  sl_percent: 1.0
+  indicators:
+    - rsi
+    - macd
+    - bb
+    - sma
+    - ema
+    - adx
+    - stoch
+    - obv
+  model_type: gb
