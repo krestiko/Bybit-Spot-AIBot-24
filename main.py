@@ -2,18 +2,27 @@ import time
 import os
 import logging
 import numpy as np
+import requests
 from sklearn.linear_model import SGDClassifier
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, GridSearchCV
 from xgboost import XGBClassifier
 import pandas as pd
+np.NaN = np.nan  # compatibility for pandas_ta
 import pandas_ta as ta
 import joblib
 from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
+import yaml
 
 load_dotenv()
+config_path = os.getenv("CONFIG_FILE", "config.yaml")
+if os.path.exists(config_path):
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f) or {}
+else:
+    config = {}
 log_file = os.getenv("LOG_FILE", "bot.log")
 logging.basicConfig(
     level=logging.INFO,
@@ -25,8 +34,8 @@ api_key = os.getenv("BYBIT_API_KEY")
 api_secret = os.getenv("BYBIT_API_SECRET")
 symbol = os.getenv("SYMBOL", "BTCUSDT")
 trade_amount = float(os.getenv("TRADE_AMOUNT_USDT", 10))
-tp_percent = float(os.getenv("TP_PERCENT", 1.5))
-sl_percent = float(os.getenv("SL_PERCENT", 1.0))
+tp_percent = float(config.get("trade", {}).get("tp_percent", os.getenv("TP_PERCENT", 1.5)))
+sl_percent = float(config.get("trade", {}).get("sl_percent", os.getenv("SL_PERCENT", 1.0)))
 interval = int(os.getenv("INTERVAL", 5)) * 60
 max_retries = int(os.getenv("MAX_RETRIES", 3))
 
@@ -35,9 +44,23 @@ history_len = int(os.getenv("HISTORY_LENGTH", 100))
 price_file = os.getenv("PRICE_HISTORY_FILE", "price_history.csv")
 trade_file = os.getenv("TRADE_HISTORY_FILE", "trade_history.csv")
 trailing_percent = float(os.getenv("TRAILING_PERCENT", 0))
-model_type = os.getenv("MODEL_TYPE", "gb")
+model_type = config.get("trade", {}).get("model_type", os.getenv("MODEL_TYPE", "gb"))
 daily_loss_limit = float(os.getenv("DAILY_STOP_LOSS", 0))
 daily_profit_limit = float(os.getenv("DAILY_TAKE_PROFIT", 0))
+
+indicators = config.get("trade", {}).get(
+    "indicators",
+    [
+        "rsi",
+        "macd",
+        "bb",
+        "sma",
+        "ema",
+        "adx",
+        "stoch",
+        "obv",
+    ],
+)
 
 telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
 telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -72,12 +95,34 @@ daily_date = time.strftime("%Y-%m-%d")
 
 def send_telegram(msg):
     if not telegram_token or not telegram_chat_id: return
-    import requests
     try:
         requests.post(f"https://api.telegram.org/bot{telegram_token}/sendMessage",
                       data={"chat_id": telegram_chat_id, "text": msg})
     except Exception as e:
         logging.warning(f"Telegram error: {e}")
+
+def fetch_news_sentiment():
+    token = os.getenv("CRYPTO_NEWS_TOKEN")
+    if not token:
+        return 0.0
+    try:
+        resp = requests.get(
+            "https://cryptopanic.com/api/v1/posts/",
+            params={"auth_token": token, "kind": "news", "public": "true"},
+            timeout=10,
+        )
+        data = resp.json()
+        posts = data.get("results", [])[:10]
+        score = 0.0
+        for p in posts:
+            if p.get("positive_votes", 0) >= p.get("negative_votes", 0):
+                score += 1
+            else:
+                score -= 1
+        return score / max(len(posts), 1)
+    except Exception as e:
+        logging.warning(f"News fetch error: {e}")
+        return 0.0
 
 session = HTTP(api_key=api_key, api_secret=api_secret)
 
@@ -99,27 +144,48 @@ def get_market_data():
 
 def compute_features(df):
     df = df.copy()
-    df["rsi"] = ta.rsi(df["close"], length=14)
-    macd = ta.macd(df["close"])
-    df["macd"] = macd["MACD_12_26_9"]
-    bb = ta.bbands(df["close"], length=5)
-    df["bb_upper"] = bb["BBU_5_2.0"]
-    df["bb_lower"] = bb["BBL_5_2.0"]
-    df["sma"] = ta.sma(df["close"], length=10)
-    df["ema"] = ta.ema(df["close"], length=10)
-    adx = ta.adx(df["close"], length=14)
-    df["adx"] = adx["ADX_14"]
-    stoch = ta.stoch(df["close"])
-    df["stoch_k"] = stoch["STOCHk_14_3_3"]
-    df["stoch_d"] = stoch["STOCHd_14_3_3"]
-    df["obv"] = ta.obv(df["close"], df["volume"])
+    feats = []
+    required = []
+    if "rsi" in indicators:
+        df["rsi"] = ta.rsi(df["close"], length=14)
+        required.append("rsi")
+    if "macd" in indicators:
+        macd = ta.macd(df["close"])
+        df["macd"] = macd["MACD_12_26_9"]
+        required.append("macd")
+    if "bb" in indicators:
+        bb = ta.bbands(df["close"], length=5)
+        df["bb_upper"] = bb["BBU_5_2.0"]
+        df["bb_lower"] = bb["BBL_5_2.0"]
+        required.extend(["bb_upper", "bb_lower"])
+    if "sma" in indicators:
+        df["sma"] = ta.sma(df["close"], length=10)
+        required.append("sma")
+    if "ema" in indicators:
+        df["ema"] = ta.ema(df["close"], length=10)
+        required.append("ema")
+    if "adx" in indicators:
+        adx = ta.adx(df["close"], length=14)
+        df["adx"] = adx["ADX_14"]
+        required.append("adx")
+    if "stoch" in indicators:
+        stoch = ta.stoch(df["close"])
+        df["stoch_k"] = stoch["STOCHk_14_3_3"]
+        df["stoch_d"] = stoch["STOCHd_14_3_3"]
+        required.extend(["stoch_k", "stoch_d"])
+    if "obv" in indicators:
+        df["obv"] = ta.obv(df["close"], df["volume"])
+        required.append("obv")
     df["bid_ask_ratio"] = (df["bid_qty"] - df["ask_qty"]) / (df["bid_qty"] + df["ask_qty"])
+    required.append("bid_ask_ratio")
+    if "news" in indicators:
+        df["sentiment"] = fetch_news_sentiment()
+        required.append("sentiment")
     row = df.iloc[-1]
-    required = ["rsi", "macd", "bb_upper", "bb_lower", "sma", "ema", "adx", "stoch_k", "stoch_d", "obv", "bid_ask_ratio"]
     if row[required].isna().any():
         return None
     feats = row[required + ["volume"]].values
-    return feats.reshape(1, -1)
+    return np.array(feats, dtype=float).reshape(1, -1)
 
 def append_market_data(price, volume, bid, ask):
     global history_df
@@ -140,6 +206,9 @@ def update_model(price, volume, bid, ask):
     label = 1 if df["close"].iloc[-1] > df["close"].iloc[-2] else 0
     features_list.append(features.flatten())
     labels_list.append(label)
+    if len(features_list) > history_len:
+        features_list.pop(0)
+        labels_list.pop(0)
     X = np.array(features_list)
     y = np.array(labels_list)
     scaler.fit(X)
@@ -163,6 +232,11 @@ def update_model(price, volume, bid, ask):
             logging.info(f"CV score: {score:.3f}")
     except Exception as e:
         logging.warning(f"Model train error: {e}")
+    if model_initialized and hasattr(model, "partial_fit"):
+        try:
+            model.partial_fit(scaler.transform(features), [label], classes=np.array([0, 1]))
+        except Exception as e:
+            logging.warning(f"Partial fit error: {e}")
     joblib.dump({"model": model, "scaler": scaler}, model_file)
     model_initialized = True
     latest = compute_features(df.iloc[-history_len:])
@@ -187,129 +261,3 @@ def reset_daily_pnl():
 def update_pnl(profit):
     global daily_pnl
     daily_pnl += profit
- 
-def check_balance(side, amount):
-    try:
-        bal = session.get_wallet_balance(accountType="UNIFIED")
-        coins = {c["coin"]: float(c.get("availableToTrade", 0))
-                 for c in bal["result"]["list"][0]["coin"]}
-        base = symbol.replace("USDT", "")
-        if side == "Buy":
-            return coins.get("USDT", 0) >= amount
-        else:
-            return coins.get(base, 0) > 0
-    except Exception as e:
-        logging.warning(f"Balance check error: {e}")
-        return True
-
-def place_order(side, price, amount):
-    for _ in range(max_retries):
-        try:
-            resp = session.place_order(
-                category="spot",
-                symbol=symbol,
-                side=side,
-                order_type="Market",
-                quote_qty=amount,
-                time_in_force="IOC",
-            )
-            if resp.get("retCode") != 0:
-                raise Exception(resp.get("retMsg"))
-            order_id = resp["result"]["orderId"]
-            for _ in range(5):
-                info = session.get_order_history(category="spot", orderId=order_id)
-                status = info["result"]["list"][0]["orderStatus"]
-                if status == "Filled":
-                    msg = f"{side} executed {symbol} at {price} for {amount}"
-                    logging.info(msg)
-                    send_telegram(msg)
-                    with open(trade_file, "a") as f:
-                        f.write(f"{time.time()},{side},{price},{amount}\n")
-                    return True
-                time.sleep(1)
-        except Exception as e:
-            logging.warning(f"Order error: {e}")
-            time.sleep(1)
-    logging.error("Failed to place order")
-    send_telegram("Failed to place order")
-    return False
-
-def trade_loop():
-    logging.info(f"Bot start: {symbol}, {trade_amount} USDT per trade")
-    send_telegram(f"Bot live: trading {symbol}, every {interval//60} min")
-    global position_price, trailing_stop_price, position_amount
-    trailing_stop_price = None
-    while True:
-        try:
-            reset_daily_pnl()
-            if daily_loss_limit and daily_pnl <= -daily_loss_limit:
-                logging.warning("Daily loss limit reached")
-                time.sleep(interval)
-                continue
-            if daily_profit_limit and daily_pnl >= daily_profit_limit:
-                logging.info("Daily profit target reached")
-                time.sleep(interval)
-                continue
-            price, volume, bid, ask = get_market_data()
-            logging.info(f"Price: {price}")
-            features = update_model(price, volume, bid, ask)
-            if position_price is not None:
-                if trailing_percent > 0:
-                    new_stop = price * (1 - trailing_percent / 100)
-                    if trailing_stop_price is None or new_stop > trailing_stop_price:
-                        trailing_stop_price = new_stop
-                sl_level = position_price * (1 - sl_percent / 100)
-                if trailing_stop_price:
-                    sl_level = max(sl_level, trailing_stop_price)
-                if price >= position_price * (1 + tp_percent / 100):
-                    amt = compute_trade_amount()
-                    if check_balance("Sell", amt) and place_order("Sell", price, amt):
-                        send_telegram(f"Take profit at {price}")
-                        profit = (price - position_price) * (position_amount / position_price)
-                        update_pnl(profit)
-                        position_price = None
-                        position_amount = 0
-                        trailing_stop_price = None
-                    continue
-                if price <= sl_level:
-                    amt = compute_trade_amount()
-                    if check_balance("Sell", amt) and place_order("Sell", price, amt):
-                        send_telegram(f"Stop loss at {price}")
-                        profit = (price - position_price) * (position_amount / position_price)
-                        update_pnl(profit)
-                        position_price = None
-                        position_amount = 0
-                        trailing_stop_price = None
-                    continue
-
-            if model_initialized and features is not None:
-                prediction = model.predict(features)[0]
-                decision = "Buy" if prediction == 1 else "Sell"
-            else:
-                if len(history_df) >= 2:
-                    avg = history_df["close"].mean()
-                    decision = "Buy" if price > avg else "Sell"
-                else:
-                    decision = "Buy" if int(price) % 2 == 0 else "Sell"
-
-            amt = compute_trade_amount()
-            if position_price is None and decision == "Buy":
-                if check_balance("Buy", amt) and place_order("Buy", price, amt):
-                    position_price = price
-                    position_amount = amt
-                    if trailing_percent > 0:
-                        trailing_stop_price = price * (1 - trailing_percent / 100)
-            elif position_price is not None and decision == "Sell":
-                if check_balance("Sell", amt) and place_order("Sell", price, amt):
-                    profit = (price - position_price) * (position_amount / position_price)
-                    update_pnl(profit)
-                    position_price = None
-                    position_amount = 0
-                    trailing_stop_price = None
-        except Exception as e:
-            logging.error(f"Loop error: {e}")
-            send_telegram(f"Bot error: {e}")
-        time.sleep(interval)
-
-if __name__ == "__main__":
-    trade_loop()
